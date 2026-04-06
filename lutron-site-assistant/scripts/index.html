@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>STA Lutron Site Assistant</title>
+</head>
+<body>
+<script>
+
+// ─────────────────────────────────────────────
+// STA Smart Homes — Lutron Site Assistant Skill
+// Edge Gallery JS Skill Handler
+// ─────────────────────────────────────────────
+
+const SYSTEM_RULES = {
+  homeworks_qsx: {
+    max_dimmer_watts: 500,
+    max_switch_amps: 16,
+    dali_max_devices_per_bus: 64,
+    max_processors: 12,
+    label: "Homeworks QSX"
+  },
+  radiora3: {
+    max_dimmer_watts: 500,
+    max_devices_typeA: 200,
+    max_devices_typeX: 200,
+    max_total_devices: 400,
+    label: "RadioRA 3"
+  },
+  dali: {
+    max_devices_per_bus: 64,
+    requires_dali2: true,
+    label: "DALI"
+  }
+};
+
+const LOAD_DERATING = {
+  led:          { factor: 1.0, note: "LED — no derating required" },
+  incandescent: { factor: 1.0, note: "Incandescent — no derating required" },
+  mlv:          { factor: 0.7, note: "MLV — derate to 70% of transformer VA rating" },
+  elv:          { factor: 1.0, note: "ELV — check transformer compatibility" },
+  dali_driver:  { factor: 1.0, note: "DALI-2 driver — verify DiiA certification" },
+  fluorescent:  { factor: 0.8, note: "Fluorescent — derate to 80%, check ballast compatibility" }
+};
+
+// ─── TOOL: Circuit Count Estimation ───────────
+function circuitCount(data) {
+  const system = SYSTEM_RULES[data.system] || {};
+  const systemLabel = system.label || data.system;
+  const rooms = data.rooms || [];
+  let totalQuoted = 0, totalActual = 0;
+  const roomResults = [], exclusionNotes = [];
+
+  for (const room of rooms) {
+    const quoted = parseInt(room.quoted_circuits) || 0;
+    const actual = parseInt(room.actual_circuits) || 0;
+    const delta = actual - quoted;
+    totalQuoted += quoted;
+    totalActual += actual;
+    const note = room.notes || "";
+    const flags = [];
+    if (/led strip/i.test(note))  flags.push("LED strip excluded (per STA standard)");
+    if (/wireless/i.test(note))   flags.push("Wireless device excluded from circuit count");
+    if (/combined/i.test(note))   flags.push("Lutron cable runs combined per room");
+    if (note && flags.length === 0) flags.push(note);
+    if (flags.length > 0) exclusionNotes.push(`${room.name}: ${flags.join("; ")}`);
+    roomResults.push({ room: room.name, quoted, actual, delta,
+      status: delta > 0 ? "ADDITION" : delta < 0 ? "REDUCTION" : "MATCH", flags });
+  }
+
+  const totalDelta = totalActual - totalQuoted;
+  return {
+    tool: "circuit_count", system: systemLabel,
+    summary: { total_quoted: totalQuoted, total_actual: totalActual, total_delta: totalDelta,
+      delta_label: totalDelta > 0 ? `+${totalDelta} additional circuits` : totalDelta < 0 ? `${totalDelta} circuits removed` : "No change" },
+    rooms: roomResults, exclusions: exclusionNotes,
+    report_text: buildCircuitReport(systemLabel, roomResults, totalQuoted, totalActual, totalDelta, exclusionNotes)
+  };
+}
+
+function buildCircuitReport(systemLabel, rooms, tQ, tA, tD, exclusions) {
+  const lines = [`## Lutron Circuit Count — ${systemLabel}`, `**System:** ${systemLabel}`, "",
+    "| Room | Quoted | Actual | Delta | Status |", "|------|--------|--------|-------|--------|"];
+  for (const r of rooms) lines.push(`| ${r.room} | ${r.quoted} | ${r.actual} | ${r.delta > 0 ? "+" : ""}${r.delta} | ${r.status} |`);
+  lines.push("", `**Total Quoted:** ${tQ}`, `**Total Actual:** ${tA}`, `**Net Variance:** ${tD > 0 ? "+" : ""}${tD} circuits`);
+  if (exclusions.length > 0) { lines.push("", "### Notes & Exclusions"); exclusions.forEach(e => lines.push(`- ${e}`)); }
+  return lines.join("\n");
+}
+
+// ─── TOOL: Load Calculation ────────────────────
+function loadCalc(data) {
+  const system = SYSTEM_RULES[data.system] || {};
+  const systemLabel = system.label || data.system;
+  const maxWatts = system.max_dimmer_watts || 500;
+  const circuits = data.circuits || [];
+  let totalLoad = 0;
+  const results = [];
+
+  for (const c of circuits) {
+    const wattage = parseFloat(c.wattage) || 0;
+    const loadType = (c.load_type || "led").toLowerCase();
+    const derating = LOAD_DERATING[loadType] || LOAD_DERATING["led"];
+    const effectiveMax = maxWatts * derating.factor;
+    const percentUsed = Math.round((wattage / effectiveMax) * 100);
+    totalLoad += wattage;
+    let status, flag;
+    if (wattage > effectiveMax) {
+      status = "OVER"; flag = `⚠️ OVERLOADED — ${wattage}W exceeds ${effectiveMax}W limit. Split circuit or use higher-rated module.`;
+    } else if (percentUsed >= 80) {
+      status = "WARNING"; flag = `⚠️ HIGH LOAD — ${percentUsed}% of capacity. Consider load balancing.`;
+    } else {
+      status = "OK"; flag = `✓ ${percentUsed}% of capacity`;
+    }
+    results.push({ label: c.label, load_type: loadType, wattage, effective_max: effectiveMax,
+      percent_used: percentUsed, status, flag, derating_note: derating.note, dimmer_model: c.dimmer_model || null });
+  }
+
+  return {
+    tool: "load_calc", system: systemLabel,
+    summary: { total_circuits: circuits.length, total_load_watts: totalLoad,
+      over_count: results.filter(r => r.status === "OVER").length,
+      warning_count: results.filter(r => r.status === "WARNING").length,
+      ok_count: results.filter(r => r.status === "OK").length },
+    circuits: results,
+    report_text: buildLoadReport(systemLabel, results, totalLoad)
+  };
+}
+
+function buildLoadReport(systemLabel, circuits, totalLoad) {
+  const lines = [`## Load Calculation Report — ${systemLabel}`, "",
+    "| Circuit | Load Type | Watts | Max (W) | % Used | Status |",
+    "|---------|-----------|-------|---------|--------|--------|"];
+  for (const c of circuits) lines.push(`| ${c.label} | ${c.load_type} | ${c.wattage} | ${c.effective_max} | ${c.percent_used}% | ${c.status} |`);
+  lines.push("", `**Total System Load:** ${totalLoad}W across ${circuits.length} circuits`);
+  const issues = circuits.filter(c => c.status !== "OK");
+  if (issues.length > 0) {
+    lines.push("", "### ⚠️ Issues Requiring Attention");
+    for (const c of issues) {
+      lines.push(`- **${c.label}**: ${c.flag}`, `  - Derating note: ${c.derating_note}`);
+      if (c.dimmer_model) lines.push(`  - Dimmer: ${c.dimmer_model}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// ─── TOOL: Cable Label Scheme ──────────────────
+function labelScheme(data) {
+  const system = SYSTEM_RULES[data.system] || {};
+  const systemLabel = system.label || data.system;
+  const count = parseInt(data.circuit_count) || 1;
+  const labelType = data.label_type || "circuit";
+  const location = data.location || "Panel";
+  const prefix = data.prefix || "C";
+  const labels = [];
+
+  if (labelType === "circuit" || labelType === "both") {
+    for (let i = 1; i <= count; i++)
+      labels.push({ type: "circuit", label: `${prefix}${i}`, description: `Circuit ${i} — ${location}` });
+  }
+  if (labelType === "network" || labelType === "both") {
+    const networkCount = Math.ceil(count / 4);
+    for (let p = 1; p <= networkCount; p++)
+      for (let port = 1; port <= 4; port++)
+        labels.push({ type: "network", label: `PP${p}-P${port}`, description: `Patch Panel ${p}, Port ${port} — ${location}` });
+  }
+
+  const printReady = labels.map(l => l.label).join(", ");
+  return { tool: "label_scheme", system: systemLabel, location, total_labels: labels.length,
+    labels, print_ready: printReady, report_text: buildLabelReport(systemLabel, location, labels, printReady) };
+}
+
+function buildLabelReport(systemLabel, location, labels, printReady) {
+  const lines = [`## Cable Label Scheme — ${location} (${systemLabel})`, "",
+    "| Label | Type | Description |", "|-------|------|-------------|"];
+  for (const l of labels) lines.push(`| ${l.label} | ${l.type} | ${l.description} |`);
+  lines.push("", "### Print-Ready Label String", "```", printReady, "```",
+    "_Copy the above for heat shrink label printing (RS Components / CPC Farnell format)._");
+  return lines.join("\n");
+}
+
+// ─── TOOL: Wire Run / Home-Run Planner ─────────
+function wireRun(data) {
+  const system = SYSTEM_RULES[data.system] || {};
+  const systemLabel = system.label || data.system;
+  const panelLocation = data.panel_location || "Main Panel";
+  const cableType = data.cable_type || "2.5mm_twin_earth";
+  const rooms = data.rooms || [];
+  const FLOOR_OFFSET = { basement: 5, ground: 0, first: 4, second: 8 };
+  const DRUM_SIZE = 50;
+  const WASTE_FACTOR = 1.15;
+  let totalCable = 0;
+  const roomResults = [];
+
+  for (const room of rooms) {
+    const baseRun = parseFloat(room.estimated_run_metres) || 10;
+    const floorAdd = FLOOR_OFFSET[room.floor] || 0;
+    const circuits = parseInt(room.circuits) || 1;
+    const runPerCircuit = (baseRun + floorAdd) * WASTE_FACTOR;
+    const totalRoomCable = runPerCircuit * circuits;
+    totalCable += totalRoomCable;
+    roomResults.push({ room: room.name, floor: room.floor, circuits,
+      run_per_circuit_m: Math.ceil(runPerCircuit), total_room_cable_m: Math.ceil(totalRoomCable) });
+  }
+
+  const totalWithWaste = Math.ceil(totalCable);
+  const drumsNeeded = Math.ceil(totalWithWaste / DRUM_SIZE);
+  const grouped = {};
+  for (const r of roomResults) { if (!grouped[r.floor]) grouped[r.floor] = []; grouped[r.floor].push(r.room); }
+
+  return { tool: "wire_run", system: systemLabel, panel_location: panelLocation, cable_type: cableType,
+    summary: { total_cable_metres: totalWithWaste, drums_needed: drumsNeeded, drum_size_m: DRUM_SIZE, waste_factor_percent: 15 },
+    rooms: roomResults, home_run_groups: grouped,
+    report_text: buildWireReport(systemLabel, panelLocation, cableType, roomResults, totalWithWaste, drumsNeeded, grouped) };
+}
+
+function buildWireReport(systemLabel, panelLocation, cableType, rooms, totalCable, drums, groups) {
+  const lines = [`## Wire Run Plan — ${systemLabel}`, `**Panel Location:** ${panelLocation}`,
+    `**Cable Type:** ${cableType}`, "",
+    "| Room | Floor | Circuits | Run/Circuit (m) | Total (m) |",
+    "|------|-------|----------|-----------------|-----------|"];
+  for (const r of rooms) lines.push(`| ${r.room} | ${r.floor} | ${r.circuits} | ${r.run_per_circuit_m} | ${r.total_room_cable_m} |`);
+  lines.push("", `**Total Cable Required:** ${totalCable}m (incl. 15% waste)`, `**Drums Required:** ${drums} × 50m`,
+    "", "### Home-Run Grouping Suggestions");
+  for (const [floor, roomList] of Object.entries(groups))
+    lines.push(`- **${floor.charAt(0).toUpperCase() + floor.slice(1)} Floor:** ${roomList.join(", ")}`);
+  return lines.join("\n");
+}
+
+// ─── Main Entry Point ──────────────────────────
+window.ai_edge_gallery_get_result = async function(data) {
+  try {
+    const tool = data.tool;
+    if (tool === "circuit_count") return JSON.stringify(circuitCount(data));
+    if (tool === "load_calc")     return JSON.stringify(loadCalc(data));
+    if (tool === "label_scheme")  return JSON.stringify(labelScheme(data));
+    if (tool === "wire_run")      return JSON.stringify(wireRun(data));
+    return JSON.stringify({ error: `Unknown tool: ${tool}. Available: circuit_count, load_calc, label_scheme, wire_run` });
+  } catch (e) {
+    return JSON.stringify({ error: e.message });
+  }
+};
+
+</script>
+</body>
+</html>
