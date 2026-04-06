@@ -1,37 +1,40 @@
-# Floor Plan Electrical Analyser
+# Floor Plan Electrical Analyser v3
 
-A Claude Vision powered React app for STA Smart Homes. Upload a floor plan (PDF or image) and get a full electrical point schedule in seconds.
+Claude Vision powered React app — upload a floor plan (PDF or image), get a full electrical schedule AND an annotated plan with icons drawn directly on the drawing.
 
 ## Features
 
-- **PDF support** — multi-page PDFs rendered via PDF.js, page thumbnail picker to select the right floor
-- **Image support** — PNG, JPG, WEBP
-- **Estimates**: sockets, light switches, data points, TV points, light circuits, USB outlets, EV charger, cooker circuit, bathroom points, consumer unit ways
-- **Standards**: UK Domestic BS 7671 18th Edition, UK Commercial, EU Domestic
-- **Output**: summary cards, room breakdown table, assumptions, warnings
-- **Export**: Copy report (plain text) or Export CSV
+- **PDF + image support** — multi-page PDFs with thumbnail page picker
+- **Two-call architecture**: first call generates the room schedule, second call maps icon positions as % coordinates onto the plan
+- **Annotated plan view** — coloured electrical icons overlaid on the floor plan via SVG
+- **Icon legend** — click to toggle each icon type on/off
+- **Export annotated PNG** — plan with icons baked in, ready to send to client or team
+- **Schedule view** — full room breakdown table, summary cards, assumptions, warnings
+- **Export CSV** — schedule ready for WeQuote or spreadsheet
+
+## Icon types
+
+| Icon | Colour | Meaning |
+|------|--------|---------|
+| Socket | Amber | Double socket outlet |
+| Switch | Blue | Light switch |
+| Data | Green | Cat6 data point |
+| TV | Purple | TV/coax/HDMI point |
+| Light | Yellow | Light circuit |
+| USB | Orange | USB outlet |
+| Special | Red | EV, cooker, special circuit |
 
 ## How it works
 
-1. Upload a PDF or image floor plan
-2. For PDFs: page thumbnails render client-side via PDF.js — select the floor plan page
-3. The selected page is sent to Claude Sonnet via the Anthropic API as a base64 image
-4. Claude analyses the plan room by room and returns a structured JSON electrical schedule
-5. Results display as a formatted table with summary totals
-
-## Usage in Claude.ai
-
-Open a new Claude conversation and paste the contents of `FloorplanAnalyser.jsx` as a React artifact. It calls the Anthropic API internally (no separate API key needed within Claude.ai).
+1. Upload PDF or image — PDF renders client-side via PDF.js
+2. Select floor if multi-page
+3. Hit **Analyse + Mark Up Plan**
+4. Call 1: Claude Sonnet analyses rooms and returns electrical schedule (JSON)
+5. Call 2: Claude Sonnet returns icon placements as x/y percentage coordinates
+6. SVG overlay renders icons onto the plan at correct positions
+7. Toggle icon types via legend, export as PNG
 
 ## Stack
 
-- React (hooks only, no router)
-- PDF.js 3.11.174 (via cdnjs CDN)
-- Anthropic Claude Sonnet (claude-sonnet-4-20250514)
-- Pure CSS (no Tailwind, no component library)
-
-## Notes
-
-- All PDF rendering happens in the browser — no server required
-- The API call goes directly to `api.anthropic.com/v1/messages`
-- Estimates are indicative — always verify on-site
+- React (hooks), PDF.js 3.11.174, Anthropic Claude Sonnet (claude-sonnet-4-20250514)
+- SVG overlay for icon rendering, Canvas API for PNG export
